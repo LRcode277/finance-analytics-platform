@@ -2,6 +2,8 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from data.alpha_vantage import get_overview_info, is_available as alpha_available
+
 
 # ---------------------------------------------------------
 # Helpers
@@ -174,7 +176,20 @@ def get_company_metrics(ticker):
 
     try:
         stock = yf.Ticker(ticker)
-        info = stock.info or {}
+        try:
+            info = stock.info or {}
+        except Exception:
+            info = {}
+
+        # Streamlit Cloud can receive empty Yahoo quote-summary responses.
+        # Use one Alpha Vantage OVERVIEW call only when the core peer metrics
+        # are absent. The provider adapter is cached for the process lifetime.
+        core_keys = ("marketCap", "trailingPE", "totalRevenue")
+        if alpha_available() and not any(info.get(k) is not None for k in core_keys):
+            fallback = get_overview_info(ticker)
+            for key, value in fallback.items():
+                if info.get(key) in (None, "", "N/A"):
+                    info[key] = value
 
         company_name = (
             info.get("shortName")
@@ -186,6 +201,22 @@ def get_company_metrics(ticker):
             info.get("currentPrice")
             or info.get("regularMarketPrice")
         )
+        if price is None:
+            try:
+                fast = dict(stock.fast_info)
+                price = fast.get("last_price") or fast.get("lastPrice")
+                if info.get("marketCap") is None:
+                    info["marketCap"] = fast.get("market_cap") or fast.get("marketCap")
+            except Exception:
+                pass
+
+        gross_margin = info.get("grossMargins")
+        if gross_margin is None:
+            gp, rev = info.get("grossProfits"), info.get("totalRevenue")
+            try:
+                gross_margin = float(gp) / float(rev) if float(rev) else None
+            except Exception:
+                gross_margin = None
 
         return {
             "Company": company_name,
@@ -210,7 +241,7 @@ def get_company_metrics(ticker):
             ),
 
             "Gross Margin": to_percent(
-                info.get("grossMargins")
+                gross_margin
             ),
 
             "Operating Margin": to_percent(

@@ -2,6 +2,8 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+from data.alpha_vantage import get_estimate_tables, get_overview_info, get_statements, is_available as alpha_available
+
 
 YAHOO_SEARCH_URL = "https://query1.finance.yahoo.com/v1/finance/search"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
@@ -126,6 +128,11 @@ def get_stock_data(ticker, period="5y"):
     info = merge_fast_info(info, fast_info)
     info = merge_missing(info, yahoo_search_fallback(ticker))
 
+    # Hosted environments can lose Yahoo quote-summary data while price history
+    # still works. Alpha Vantage fills only missing fields; Yahoo remains primary.
+    if alpha_available():
+        info = merge_missing(info, get_overview_info(ticker))
+
     try:
         income = stock.financials
     except Exception:
@@ -177,6 +184,36 @@ def get_stock_data(ticker, period="5y"):
         growth_estimates = stock.growth_estimates
     except Exception:
         growth_estimates = pd.DataFrame()
+
+    # Financial-statement fallback. Fetch Alpha Vantage statements only when at
+    # least one core Yahoo statement is unavailable, limiting API usage.
+    if alpha_available() and (income.empty or balance.empty or cashflow.empty):
+        av_income, av_balance, av_cashflow, av_quarterly_income = get_statements(ticker)
+        if income.empty and not av_income.empty:
+            income = av_income
+        if balance.empty and not av_balance.empty:
+            balance = av_balance
+        if cashflow.empty and not av_cashflow.empty:
+            cashflow = av_cashflow
+        if quarterly_income.empty and not av_quarterly_income.empty:
+            quarterly_income = av_quarterly_income
+
+    # Alpha Vantage provides annual/quarterly EPS and revenue estimates. Use it
+    # only where Yahoo estimate tables are missing.
+    estimate_meta = {}
+    if alpha_available() and (revenue_estimate.empty or earnings_estimate.empty or growth_estimates.empty):
+        av_revenue, av_earnings, av_growth, estimate_meta = get_estimate_tables(ticker)
+        if revenue_estimate.empty and not av_revenue.empty:
+            revenue_estimate = av_revenue
+        if earnings_estimate.empty and not av_earnings.empty:
+            earnings_estimate = av_earnings
+        if growth_estimates.empty and not av_growth.empty:
+            growth_estimates = av_growth
+
+    if info.get("numberOfAnalystOpinions") in (None, "", "N/A"):
+        analyst_count = estimate_meta.get("analyst_count")
+        if analyst_count is not None and not pd.isna(analyst_count):
+            info["numberOfAnalystOpinions"] = analyst_count
 
     return {
         "ticker": ticker,
