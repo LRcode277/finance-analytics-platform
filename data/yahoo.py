@@ -3,6 +3,13 @@ import requests
 import yfinance as yf
 
 from data.alpha_vantage import get_estimate_tables, get_overview_info, get_statements, is_available as alpha_available
+from data.finnhub import (
+    get_estimate_tables as finnhub_estimate_tables,
+    get_info as finnhub_info,
+    get_price_targets as finnhub_price_targets,
+    get_recommendations as finnhub_recommendations,
+    is_available as finnhub_available,
+)
 
 
 YAHOO_SEARCH_URL = "https://query1.finance.yahoo.com/v1/finance/search"
@@ -127,6 +134,8 @@ def get_stock_data(ticker, period="5y"):
     fast_info = safe_fast_info(stock)
     info = merge_fast_info(info, fast_info)
     info = merge_missing(info, yahoo_search_fallback(ticker))
+    if finnhub_available():
+        info = merge_missing(info, finnhub_info(ticker))
 
     # Hosted environments can lose Yahoo quote-summary data while price history
     # still works. Alpha Vantage fills only missing fields; Yahoo remains primary.
@@ -163,12 +172,25 @@ def get_stock_data(ticker, period="5y"):
     except Exception:
         recommendations_summary = pd.DataFrame()
 
+    # Recommendation trends are available from Finnhub even when Yahoo quote-summary
+    # endpoints are blocked on hosted servers.
+    if finnhub_available() and (recommendations_summary is None or recommendations_summary.empty):
+        fh_recs, fh_rec_meta = finnhub_recommendations(ticker)
+        if not fh_recs.empty:
+            recommendations_summary = fh_recs
+        info = merge_missing(info, fh_rec_meta)
+
     try:
         analyst_price_targets = stock.analyst_price_targets
         if analyst_price_targets is None:
             analyst_price_targets = {}
     except Exception:
         analyst_price_targets = {}
+
+    if finnhub_available() and not analyst_price_targets:
+        fh_targets, fh_target_meta = finnhub_price_targets(ticker)
+        analyst_price_targets = fh_targets or analyst_price_targets
+        info = merge_missing(info, fh_target_meta)
 
     try:
         revenue_estimate = stock.revenue_estimate
@@ -197,6 +219,14 @@ def get_stock_data(ticker, period="5y"):
             cashflow = av_cashflow
         if quarterly_income.empty and not av_quarterly_income.empty:
             quarterly_income = av_quarterly_income
+
+    # Finnhub estimates are used automatically when the account plan permits them.
+    if finnhub_available() and (revenue_estimate.empty or earnings_estimate.empty):
+        fh_revenue, fh_earnings = finnhub_estimate_tables(ticker)
+        if revenue_estimate.empty and not fh_revenue.empty:
+            revenue_estimate = fh_revenue
+        if earnings_estimate.empty and not fh_earnings.empty:
+            earnings_estimate = fh_earnings
 
     # Alpha Vantage provides annual/quarterly EPS and revenue estimates. Use it
     # only where Yahoo estimate tables are missing.

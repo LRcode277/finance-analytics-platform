@@ -3,6 +3,7 @@ import pandas as pd
 import yfinance as yf
 
 from data.alpha_vantage import get_overview_info, is_available as alpha_available
+from data.finnhub import get_info as finnhub_info, get_peers as finnhub_peers, is_available as finnhub_available
 
 
 # ---------------------------------------------------------
@@ -156,7 +157,10 @@ def get_peer_tickers(ticker, info, max_peers=6):
 
     sector = info.get("sector")
 
-    peer_list = SECTOR_PEERS.get(sector, []).copy()
+    # Prefer live industry peers from Finnhub on hosted deployments.
+    peer_list = finnhub_peers(ticker, limit=max_peers + 3) if finnhub_available() else []
+    if not peer_list:
+        peer_list = SECTOR_PEERS.get(sector, []).copy()
 
     # Always include the company being analyzed
     if ticker in peer_list:
@@ -180,6 +184,13 @@ def get_company_metrics(ticker):
             info = stock.info or {}
         except Exception:
             info = {}
+
+        # Finnhub basic financials/profile are cloud-friendly and fill Yahoo gaps.
+        if finnhub_available():
+            fallback = finnhub_info(ticker)
+            for key, value in fallback.items():
+                if info.get(key) in (None, "", "N/A"):
+                    info[key] = value
 
         # Streamlit Cloud can receive empty Yahoo quote-summary responses.
         # Use one Alpha Vantage OVERVIEW call only when the core peer metrics
