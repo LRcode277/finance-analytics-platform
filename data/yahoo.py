@@ -1,267 +1,182 @@
-import time
-
 import pandas as pd
+import requests
 import yfinance as yf
 
 
-# ---------------------------------------------------------
-# YFINANCE NETWORK CONFIGURATION
-# ---------------------------------------------------------
-
-# Retry transient Yahoo/network failures.
-# Supported by recent versions of yfinance.
-try:
-    yf.config.network.retries = 3
-except Exception:
-    pass
-
-
-# ---------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------
-
-def safe_call(func, default=None, retries=2, delay=0.8):
-    """
-    Execute a yfinance request with a small retry mechanism.
-
-    This is particularly useful on hosted environments where
-    Yahoo endpoints can temporarily fail or rate-limit requests.
-    """
-
-    for attempt in range(retries + 1):
-        try:
-            result = func()
-
-            if result is not None:
-                return result
-
-        except Exception:
-            pass
-
-        if attempt < retries:
-            time.sleep(delay * (attempt + 1))
-
-    return default
+YAHOO_SEARCH_URL = "https://query1.finance.yahoo.com/v1/finance/search"
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
 def safe_info(stock):
-    """
-    Retrieve Yahoo company metadata.
-
-    get_info() is attempted first. The property .info is kept
-    as a fallback for compatibility.
-    """
-
-    info = safe_call(
-        stock.get_info,
-        default=None,
-        retries=2,
-    )
-
-    if isinstance(info, dict) and info:
-        return info
-
-    info = safe_call(
-        lambda: stock.info,
-        default={},
-        retries=1,
-    )
-
-    if isinstance(info, dict):
-        return info
-
-    return {}
+    try:
+        return stock.info or {}
+    except Exception:
+        return {}
 
 
 def safe_fast_info(stock):
-    """
-    Retrieve fast market information and convert it to a
-    normal dictionary.
-    """
-
-    fast = safe_call(
-        stock.get_fast_info,
-        default=None,
-        retries=2,
-    )
-
-    if fast is None:
-        fast = safe_call(
-            lambda: stock.fast_info,
-            default=None,
-            retries=1,
-        )
-
-    if fast is None:
-        return {}
-
     try:
-        return dict(fast)
+        return dict(stock.fast_info)
     except Exception:
         return {}
 
 
 def safe_dataframe(func):
-    result = safe_call(
-        func,
-        default=pd.DataFrame(),
-        retries=1,
-    )
-
-    if isinstance(result, pd.DataFrame):
-        return result
-
+    try:
+        df = func()
+        if isinstance(df, pd.DataFrame):
+            return df
+    except Exception:
+        pass
     return pd.DataFrame()
 
 
-def safe_dict(func):
-    result = safe_call(
-        func,
-        default={},
-        retries=1,
+def yahoo_search_fallback(ticker):
+    """Use Yahoo's lightweight search endpoint to recover basic metadata.
+
+    This endpoint is already used by the app's company search and often remains
+    available when Yahoo's quote-summary endpoint (used by Ticker.info) is
+    unavailable on hosted environments.
+    """
+    try:
+        response = requests.get(
+            YAHOO_SEARCH_URL,
+            params={
+                "q": ticker,
+                "quotesCount": 10,
+                "newsCount": 0,
+                "enableFuzzyQuery": False,
+            },
+            headers=HEADERS,
+            timeout=6,
+        )
+        response.raise_for_status()
+        quotes = response.json().get("quotes", [])
+    except Exception:
+        return {}
+
+    ticker_upper = ticker.upper()
+    quote = next(
+        (q for q in quotes if str(q.get("symbol", "")).upper() == ticker_upper),
+        None,
     )
+    if not quote:
+        return {}
 
-    if isinstance(result, dict):
-        return result
-
-    return {}
-
-
-def merge_fast_info_into_info(info, fast_info):
-    """
-    Fill selected market fields when quote-summary metadata
-    is unavailable but Yahoo's faster price endpoint works.
-    """
-
-    info = dict(info or {})
-    fast_info = fast_info or {}
-
-    mapping = {
-        "marketCap": "market_cap",
-        "currentPrice": "last_price",
-        "previousClose": "previous_close",
-        "open": "open",
-        "dayHigh": "day_high",
-        "dayLow": "day_low",
-        "fiftyTwoWeekHigh": "year_high",
-        "fiftyTwoWeekLow": "year_low",
-        "sharesOutstanding": "shares",
+    # Translate search-response names to the keys expected by the rest of app.
+    candidates = {
+        "symbol": quote.get("symbol"),
+        "longName": quote.get("longname") or quote.get("shortname"),
+        "shortName": quote.get("shortname") or quote.get("longname"),
+        "quoteType": quote.get("quoteType"),
+        "sector": quote.get("sectorDisp") or quote.get("sector"),
+        "industry": quote.get("industryDisp") or quote.get("industry"),
+        "marketCap": quote.get("marketCap"),
+        "currency": quote.get("currency"),
+        "exchange": quote.get("exchange"),
+        "fullExchangeName": quote.get("exchDisp"),
     }
+    return {k: v for k, v in candidates.items() if v is not None}
 
-    for info_key, fast_key in mapping.items():
 
-        if info.get(info_key) is None:
+def merge_missing(base, fallback):
+    result = dict(base or {})
+    for key, value in (fallback or {}).items():
+        if result.get(key) in (None, "", "N/A"):
+            result[key] = value
+    return result
 
-            value = fast_info.get(fast_key)
 
+def merge_fast_info(info, fast_info):
+    # fast_info keys vary slightly by yfinance version, so support both forms.
+    aliases = {
+        "marketCap": ("market_cap", "marketCap"),
+        "currentPrice": ("last_price", "lastPrice"),
+        "previousClose": ("previous_close", "previousClose"),
+        "fiftyTwoWeekHigh": ("year_high", "yearHigh"),
+        "fiftyTwoWeekLow": ("year_low", "yearLow"),
+    }
+    result = dict(info or {})
+    for target, source_keys in aliases.items():
+        if result.get(target) is not None:
+            continue
+        for source in source_keys:
+            value = (fast_info or {}).get(source)
             if value is not None:
-                info[info_key] = value
+                result[target] = value
+                break
+    return result
 
-    return info
-
-
-# ---------------------------------------------------------
-# MAIN DATA LOADER
-# ---------------------------------------------------------
 
 def get_stock_data(ticker, period="5y"):
-
     ticker = ticker.upper().strip()
-
     stock = yf.Ticker(ticker)
 
-    # -----------------------------------------------------
-    # PRICE HISTORY
-    # -----------------------------------------------------
+    # IMPORTANT: keep the original, proven history path. Do not wrap this call
+    # in a broad retry helper because API/version errors must not become a false
+    # "No price data" result.
+    history = stock.history(period=period, auto_adjust=True)
 
-    history = safe_call(
-        lambda: stock.history(
-            period=period,
-            auto_adjust=True,
-            repair=True,
-        ),
-        default=pd.DataFrame(),
-        retries=2,
-    )
+    if history.empty:
+        raise ValueError(f"No price data found for {ticker}.")
 
-    if not isinstance(history, pd.DataFrame) or history.empty:
-        raise ValueError(
-            f"No price data found for {ticker}."
-        )
-
-    # -----------------------------------------------------
-    # COMPANY / MARKET INFORMATION
-    # -----------------------------------------------------
-
-    fast_info = safe_fast_info(stock)
+    # Primary yfinance metadata + independent lightweight fallbacks.
     info = safe_info(stock)
+    fast_info = safe_fast_info(stock)
+    info = merge_fast_info(info, fast_info)
+    info = merge_missing(info, yahoo_search_fallback(ticker))
 
-    # fast_info can still provide market cap / price data
-    # when Yahoo's quote-summary endpoint is unavailable.
-    info = merge_fast_info_into_info(
-        info,
-        fast_info,
-    )
+    try:
+        income = stock.financials
+    except Exception:
+        income = pd.DataFrame()
 
-    # -----------------------------------------------------
-    # FINANCIAL STATEMENTS
-    # -----------------------------------------------------
+    try:
+        balance = stock.balance_sheet
+    except Exception:
+        balance = pd.DataFrame()
 
-    income = safe_dataframe(
-        lambda: stock.get_income_stmt(
-            freq="yearly"
-        )
-    )
+    try:
+        cashflow = stock.cashflow
+    except Exception:
+        cashflow = pd.DataFrame()
 
-    balance = safe_dataframe(
-        lambda: stock.get_balance_sheet(
-            freq="yearly"
-        )
-    )
+    try:
+        quarterly_income = stock.quarterly_financials
+    except Exception:
+        quarterly_income = pd.DataFrame()
 
-    cashflow = safe_dataframe(
-        lambda: stock.get_cash_flow(
-            freq="yearly"
-        )
-    )
+    try:
+        recommendations = stock.recommendations
+    except Exception:
+        recommendations = pd.DataFrame()
 
-    quarterly_income = safe_dataframe(
-        lambda: stock.get_income_stmt(
-            freq="quarterly"
-        )
-    )
+    try:
+        recommendations_summary = stock.recommendations_summary
+    except Exception:
+        recommendations_summary = pd.DataFrame()
 
-    # -----------------------------------------------------
-    # WALL STREET / ANALYST DATA
-    # -----------------------------------------------------
+    try:
+        analyst_price_targets = stock.analyst_price_targets
+        if analyst_price_targets is None:
+            analyst_price_targets = {}
+    except Exception:
+        analyst_price_targets = {}
 
-    recommendations = safe_dataframe(
-        stock.get_recommendations
-    )
+    try:
+        revenue_estimate = stock.revenue_estimate
+    except Exception:
+        revenue_estimate = pd.DataFrame()
 
-    recommendations_summary = safe_dataframe(
-        stock.get_recommendations_summary
-    )
+    try:
+        earnings_estimate = stock.earnings_estimate
+    except Exception:
+        earnings_estimate = pd.DataFrame()
 
-    analyst_price_targets = safe_dict(
-        stock.get_analyst_price_targets
-    )
-
-    revenue_estimate = safe_dataframe(
-        stock.get_revenue_estimate
-    )
-
-    earnings_estimate = safe_dataframe(
-        stock.get_earnings_estimate
-    )
-
-    growth_estimates = safe_dataframe(
-        stock.get_growth_estimates
-    )
-
-    # -----------------------------------------------------
-    # RETURN NORMALIZED DATA
-    # -----------------------------------------------------
+    try:
+        growth_estimates = stock.growth_estimates
+    except Exception:
+        growth_estimates = pd.DataFrame()
 
     return {
         "ticker": ticker,
